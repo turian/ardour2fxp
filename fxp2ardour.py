@@ -8,6 +8,7 @@
 
 import argparse
 import hashlib
+import logging
 import os
 import sys
 
@@ -43,6 +44,10 @@ FXPHeader = namedtuple(
      'num_params', 'label')
 )
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 class FXPParseException(Exception):
     """Raised when there is an error parsing FXP file data."""
@@ -55,28 +60,40 @@ def parse_fxp(fn):
 
     """
     with open(fn, 'rb') as fp:
-        fxp = FXPHeader(*unpack(FXP_HEADER_FMT, fp.read(FXP_HEADER_SIZE)))
+        data = fp.read(FXP_HEADER_SIZE)
+        if len(data) != FXP_HEADER_SIZE:
+            raise FXPParseException(f"Unexpected end of file in {fn}")
+
+        fxp = FXPHeader(*unpack(FXP_HEADER_FMT, data))
         if fxp.magic != CHUNK_MAGIC:
             raise FXPParseException("Invalid magic header bytes for FXP file.")
         label = fxp.label.rstrip(b'\0').decode('latin1')
 
         if fxp.type == FX_MAGIC_PARAMS:
             params_fmt = '>{:d}f'.format(fxp.num_params)
-            params = unpack(params_fmt, fp.read(calcsize(params_fmt)))
+            params_data = fp.read(calcsize(params_fmt))
+            if len(params_data) != calcsize(params_fmt):
+                raise FXPParseException(f"Parameters data truncated in {fn}")
+
+            params = unpack(params_fmt, params_data)
             preset = Preset('VST', fxp.plugin_id, fxp.plugin_version,
                             None, label, fxp.num_params, params)
         elif fxp.type == FX_MAGIC_CHUNK:
-            chunk_size = unpack('>i', fp.read(calcsize('>i')))[0]
+            chunk_size_data = fp.read(calcsize('>i'))
+            if len(chunk_size_data) != calcsize('>i'):
+                raise FXPParseException(f"Chunk size data truncated in {fn}")
+
+            chunk_size = unpack('>i', chunk_size_data)[0]
             chunk = fp.read(chunk_size)
             if len(chunk) != chunk_size:
                 raise FXPParseException(
-                    "Program chunk data truncated, expected {:d} bytes, "
-                    "read {:d}.".format(chunk_size, len(chunk)))
+                    f"Program chunk data truncated in {fn}, expected {chunk_size} bytes, "
+                    f"read {len(chunk)}.")
             preset = ChunkPreset('VST', fxp.plugin_id, fxp.plugin_version,
                                  None, label, fxp.num_params, chunk)
         else:
-            raise FXPParseException("Invalid program type magic bytes. Type "
-                                    "'{}' not supported.".format(fxp.type))
+            raise FXPParseException(f"Invalid program type magic bytes in {fn}. Type "
+                                    f"'{fxp.type}' not supported.")
 
     return preset
 
@@ -100,7 +117,6 @@ def main(args=None):
                            help="Ardour presets output directory")
     argparser.add_argument('infiles', nargs='*', metavar='FXP',
                            help="FXP preset (input) file(s)")
-
     args = argparser.parse_args(args)
     output_dir = args.output_dir or os.getcwd()
 
@@ -110,13 +126,16 @@ def main(args=None):
 
     presets = {}
     for infile in args.infiles:
+        if not os.path.isfile(infile):
+            logger.error(f"File not found: {infile}")
+            continue
+
         try:
             preset = parse_fxp(infile)
-        except Exception as exc:
-            return "Error reading FXP preset file '{}': {}".format(
-                    infile, exc)
-        else:
             presets.setdefault(preset.plugin_id, []).append(preset)
+        except FXPParseException as e:
+            logger.error(e)
+            continue
 
     for plugin in presets:
         if not isdir(output_dir):
